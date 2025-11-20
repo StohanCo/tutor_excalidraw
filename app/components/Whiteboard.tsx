@@ -1,8 +1,10 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
 import { Excalidraw, convertToExcalidrawElements } from "@excalidraw/excalidraw";
+import "@excalidraw/excalidraw/index.css";
 import { supabase } from '@/app/components/lib/supabase';
 import { debounce } from "lodash"; // You might need to `npm install lodash @types/lodash`
+import "@excalidraw/excalidraw/index.css";
 
 export default function Whiteboard({ boardId }: { boardId: string }) {
   const [initialData, setInitialData] = useState<any>(null);
