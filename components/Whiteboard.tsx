@@ -3,19 +3,34 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { 
   Excalidraw, 
   MainMenu, 
+  convertToExcalidrawElements
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css"; 
 import { supabase } from '@/lib/supabase';
 import { debounce } from "lodash";
 
+// Random color generator for user avatars
+const getRandomColor = () => {
+  const colors = ['#f44336', '#e91e63', '#9c27b0', '#673ab7', '#3f51b5', '#2196f3', '#009688', '#4caf50', '#ff9800', '#795548'];
+  return colors[Math.floor(Math.random() * colors.length)];
+};
+
 export default function Whiteboard({ boardId }: { boardId: string }) {
+  const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
   const [initialData, setInitialData] = useState<any>(null);
+  
+  // User State
   const [userName, setUserName] = useState<string>("");
   const [isNameSet, setIsNameSet] = useState(false);
-  const [isLoading, setIsLoading] = useState(false); // Added loading state for the join process
+  const [myColor] = useState(getRandomColor()); // Assign me a consistent color
+  const [isLoading, setIsLoading] = useState(false);
+  
+  // Collab State
+  const [activeUsers, setActiveUsers] = useState<any>({});
   const participantIdRef = useRef<string | null>(null);
+  const isReceivingUpdate = useRef(false); // Prevents echo loops
 
-  // 1. LOAD DATA
+  // 1. LOAD INITIAL DATA FROM DB
   useEffect(() => {
     const loadBoard = async () => {
       const { data } = await supabase
@@ -34,152 +49,212 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     loadBoard();
   }, [boardId]);
 
-  // 2. SAVE DATA
-  const saveData = useCallback(
+  // 2. SETUP REALTIME SUBSCRIPTION (Drawings + Presence)
+  useEffect(() => {
+    if (!isNameSet || !userName) return;
+
+    const channel = supabase.channel(`room:${boardId}`, {
+      config: {
+        presence: {
+          key: userName, // Identify user by name in presence
+        },
+      },
+    });
+
+    channel
+      // A. Handle Incoming Drawings
+      .on('broadcast', { event: 'drawing-update' }, (payload) => {
+        if (excalidrawAPI) {
+            // Mark that we are processing an external update so we don't save it back immediately
+            isReceivingUpdate.current = true;
+            excalidrawAPI.updateScene({
+                elements: payload.payload.elements
+            });
+            // Reset flag after a short delay
+            setTimeout(() => { isReceivingUpdate.current = false; }, 50);
+        }
+      })
+      // B. Handle Presence (Who is here + their Viewport)
+      .on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState();
+        setActiveUsers(state);
+      })
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+           // Track my initial status
+           await channel.track({
+             user: userName,
+             color: myColor,
+             view: { x: 0, y: 0, zoom: 1 }, // Default view
+             online_at: new Date().toISOString(),
+           });
+        }
+      });
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [boardId, isNameSet, userName, excalidrawAPI, myColor]);
+
+
+  // 3. BROADCAST YOUR DRAWING CHANGES
+  // We broadcast instantly, but save to DB with debounce
+  const handleChange = (elements: readonly any[], appState: any) => {
+    // If we are just receiving data from someone else, don't broadcast it back
+    if (isReceivingUpdate.current) return;
+
+    // A. Broadcast to peers (Fast)
+    supabase.channel(`room:${boardId}`).send({
+        type: 'broadcast',
+        event: 'drawing-update',
+        payload: { elements },
+    });
+
+    // B. Save to DB (Slow/Debounced)
+    saveToDb(elements, appState);
+
+    // C. Update my Presence (Viewport position)
+    // We throttle this slightly to avoid spamming presence updates
+    updateMyPresence(appState);
+  };
+
+  const saveToDb = useCallback(
     debounce(async (elements, appState) => {
       await supabase.from('whiteboards').update({
           elements,
           app_state: appState,
           updated_at: new Date().toISOString(),
         }).eq('id', boardId);
-      
-      await supabase.from('whiteboard_versions').insert({
-          whiteboard_id: boardId,
-          elements,
-          app_state: appState
-        });
-    }, 1000),
+    }, 2000),
     [boardId]
   );
 
-  // ------------------------------------------------------------
-  // 3. NEW: GET USER INFO & JOIN
-  // ------------------------------------------------------------
+  const updateMyPresence = useCallback(
+    debounce(async (appState) => {
+        const channel = supabase.channel(`room:${boardId}`);
+        await channel.track({
+            user: userName,
+            color: myColor,
+            view: { 
+                scrollX: appState.scrollX, 
+                scrollY: appState.scrollY, 
+                zoom: appState.zoom.value 
+            }
+        });
+    }, 500), 
+    [boardId, userName, myColor]
+  );
+
+  // 4. JOIN LOGIC (Existing logic + DB Insert)
   const handleJoin = async () => {
     if (!userName) return;
-    setIsLoading(true); // Show loading while we fetch IP
+    setIsLoading(true);
 
-    // A. Gather Browser/System Info
+    // Standard join stats logic
     const userAgent = window.navigator.userAgent || "no info";
-    const screenRes = `${window.screen.width}x${window.screen.height}` || "no info";
-    
-    // B. Gather IP Address (Fetch from external service)
     let ipAddress = "no info";
     try {
-      const response = await fetch('https://api.ipify.org?format=json');
-      const data = await response.json();
-      if (data.ip) ipAddress = data.ip;
-    } catch (error) {
-      console.error("Could not fetch IP:", error);
-      // We keep 'no info' if this fails (e.g. adblocker blocked it)
-    }
+      const res = await fetch('https://api.ipify.org?format=json');
+      const data = await res.json();
+      if(data.ip) ipAddress = data.ip;
+    } catch(e) {}
 
-    setIsNameSet(true);
-
-    // C. Insert into Supabase with new fields
-    const { data, error } = await supabase
-      .from('participants')
-      .insert({
+    await supabase.from('participants').insert({
         whiteboard_id: boardId,
         user_name: userName,
         ip_address: ipAddress,
         system_info: userAgent,
-        screen_res: screenRes,
         joined_at: new Date().toISOString()
-      })
-      .select()
-      .single();
+    });
 
-    if (data) {
-      participantIdRef.current = data.id;
-    }
+    setIsNameSet(true);
     setIsLoading(false);
   };
 
-  // 4. HANDLE LEAVING
-  useEffect(() => {
-    const handleTabClose = () => {
-      if (participantIdRef.current) {
-        supabase
-          .from('participants')
-          .update({ left_at: new Date().toISOString() })
-          .eq('id', participantIdRef.current)
-          .then(); 
-      }
-    };
-    window.addEventListener('beforeunload', handleTabClose);
-    return () => {
-      window.removeEventListener('beforeunload', handleTabClose);
-      handleTabClose();
-    };
-  }, []);
-
-  // 5. HANDLE SHARING
-  const handleShare = () => {
-    const url = `${window.location.origin}/board/${boardId}`;
-    navigator.clipboard.writeText(url);
-    alert(`Link copied: ${url}`);
+  // 5. FEATURE: JUMP TO USER VIEW
+  const followUser = (userData: any) => {
+      if (!excalidrawAPI || !userData.view) return;
+      
+      excalidrawAPI.updateScene({
+          appState: {
+              scrollX: userData.view.scrollX,
+              scrollY: userData.view.scrollY,
+              zoom: { value: userData.view.zoom || 1 }
+          }
+      });
+      
+      // Visual feedback
+      alert(`Moved to ${userData.user}'s view!`);
   };
 
-  // RENDER
+  // RENDER: LOGIN SCREEN
   if (!isNameSet) {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-gray-100">
         <div className="bg-white p-8 rounded-lg shadow-lg w-96">
-          <h2 className="text-2xl font-bold mb-4">Join Whiteboard</h2>
+          <h2 className="text-2xl font-bold mb-4">Join Collaboration</h2>
           <input
             type="text"
-            placeholder="What is your name?"
+            placeholder="Enter your name"
             className="w-full border p-2 rounded mb-4 text-black"
             value={userName}
             onChange={(e) => setUserName(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleJoin()}
-            disabled={isLoading}
           />
           <button 
             onClick={handleJoin}
             disabled={isLoading}
-            className="w-full bg-blue-600 text-white p-2 rounded hover:bg-blue-700 disabled:bg-gray-400"
+            className="w-full bg-blue-600 text-white p-2 rounded hover:bg-blue-700"
           >
-            {isLoading ? "Entering..." : "Enter Room"}
+            {isLoading ? "Joining..." : "Start Drawing"}
           </button>
         </div>
       </div>
     );
   }
 
+  // RENDER: WHITEBOARD
   return (
-    <div style={{ height: "100vh", width: "100vw" }}>
+    <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
+       
+       {/* AVATAR LIST UI */}
+       <div className="absolute top-4 left-4 z-10 flex gap-2">
+          {/* Render myself */}
+          <div 
+            className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold border-2 border-white shadow-lg"
+            style={{ backgroundColor: myColor }}
+            title={`${userName} (You)`}
+          >
+            {userName.charAt(0).toUpperCase()}
+          </div>
+
+          {/* Render other users */}
+          {Object.keys(activeUsers).map((key: string) => {
+             const user = activeUsers[key][0]; // Presence state is an array of objects
+             if (user.user === userName) return null; // Don't render myself again
+
+             return (
+               <div 
+                 key={key}
+                 onClick={() => followUser(user)}
+                 className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold border-2 border-white shadow-lg cursor-pointer hover:scale-110 transition-transform"
+                 style={{ backgroundColor: user.color || '#ccc' }}
+                 title={`Click to jump to ${user.user}'s screen`}
+               >
+                 {user.user.charAt(0).toUpperCase()}
+               </div>
+             );
+          })}
+       </div>
+
        <Excalidraw
          initialData={initialData}
-         onChange={(elements, appState) => saveData(elements, appState)}
-         renderTopRightUI={() => (
-            <button 
-              style={{
-                backgroundColor: "#40c057",
-                color: "white",
-                border: "none",
-                padding: "8px 12px",
-                borderRadius: "4px",
-                cursor: "pointer",
-                height: "36px", 
-                marginLeft: "10px"
-              }}
-              onClick={handleShare}
-            >
-              Share
-            </button>
-         )}
+         excalidrawAPI={(api) => setExcalidrawAPI(api)}
+         onChange={(elements, appState) => handleChange(elements, appState)}
        >
          <MainMenu>
-            <MainMenu.DefaultItems.LoadScene />
-            <MainMenu.DefaultItems.Export />
-            <MainMenu.DefaultItems.SaveAsImage /> 
             <MainMenu.DefaultItems.ClearCanvas />
-            <MainMenu.Separator />
-            <MainMenu.Item onSelect={handleShare}>
-              Share Whiteboard
-            </MainMenu.Item>
+            <MainMenu.DefaultItems.SaveAsImage /> 
             <MainMenu.DefaultItems.ChangeCanvasBackground />
          </MainMenu>
        </Excalidraw>
