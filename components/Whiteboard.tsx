@@ -31,6 +31,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   // Collab State
   const [activeUsers, setActiveUsers] = useState<any>({});
   const isReceivingUpdate = useRef(false); 
+  const channelRef = useRef<any>(null);
 
   // ----------------------------------------------------------------
   // LOAD DATA
@@ -74,8 +75,10 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       .on('broadcast', { event: 'drawing-update' }, (payload) => {
         if (excalidrawAPI) {
             isReceivingUpdate.current = true;
+            // Apply elements and appState (if provided) to fully sync view
             excalidrawAPI.updateScene({
-                elements: payload.payload.elements
+                elements: payload.payload.elements,
+                appState: payload.payload.appState || undefined,
             });
             // Prevent echo
             setTimeout(() => { isReceivingUpdate.current = false; }, 50);
@@ -87,6 +90,8 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       })
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
+           // keep a reference to this channel so we reuse it for broadcasts
+           channelRef.current = channel;
            await channel.track({
              user: userName,
              color: myColor,
@@ -98,6 +103,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
 
     return () => {
       supabase.removeChannel(channel);
+      channelRef.current = null;
     };
   }, [boardId, isNameSet, userName, excalidrawAPI, myColor]);
 
@@ -113,11 +119,14 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     // DO NOT SAVE. This stops the "Empty Board" overwrite bug.
     if (!initialLoadDone.current) return;
 
+    // 3. If elements are empty, don't broadcast/save to avoid overwriting DB
+    if (!elements || elements.length === 0) return;
+
     // A. Broadcast to peers (Fast)
-    supabase.channel(`room:${boardId}`).send({
+    channelRef.current?.send({
         type: 'broadcast',
         event: 'drawing-update',
-        payload: { elements },
+        payload: { elements, appState },
     });
 
     // B. Save to DB (Slow/Debounced)
@@ -131,6 +140,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     debounce(async (elements, appState) => {
       // Double check inside the debounce too
       if (!initialLoadDone.current) return;
+      if (!elements || elements.length === 0) return;
       
       await supabase.from('whiteboards').update({
           elements,
@@ -143,16 +153,15 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
 
   const updateMyPresence = useCallback(
     debounce(async (appState) => {
-        const channel = supabase.channel(`room:${boardId}`);
-        await channel.track({
-            user: userName,
-            color: myColor,
-            view: { 
-                scrollX: appState.scrollX, 
-                scrollY: appState.scrollY, 
-                zoom: appState.zoom.value 
-            }
-        });
+      await channelRef.current?.track({
+        user: userName,
+        color: myColor,
+        view: { 
+          scrollX: appState.scrollX, 
+          scrollY: appState.scrollY, 
+          zoom: appState.zoom?.value || 1 
+        }
+      });
     }, 500), 
     [boardId, userName, myColor]
   );
@@ -231,7 +240,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
        
        {/* AVATAR LIST UI - Moved further LEFT to avoid Share Button */}
        {/* Changed right-36 to right-[220px] (custom tailwind value) */}
-       <div className="absolute top-4 right-[220px] z-10 flex flex-row-reverse gap-2">
+       <div className="absolute top-4 left-4 z-10 flex gap-2">
           {/* Render myself */}
           <div 
             className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold border-2 border-white shadow-lg"
