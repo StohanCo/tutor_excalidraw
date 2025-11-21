@@ -3,26 +3,25 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { 
   Excalidraw, 
   MainMenu, 
-  convertToExcalidrawElements
+  convertToExcalidrawElements,
+  getSceneVersion
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css"; 
 import { supabase } from '@/lib/supabase';
 import { debounce } from "lodash";
 
-// Random color generator for user avatars
 const getRandomColor = () => {
   const colors = ['#f44336', '#e91e63', '#9c27b0', '#673ab7', '#3f51b5', '#2196f3', '#009688', '#4caf50', '#ff9800', '#795548'];
   return colors[Math.floor(Math.random() * colors.length)];
 };
 
 export default function Whiteboard({ boardId }: { boardId: string }) {
-  // Using 'any' to bypass version type mismatch issues
   const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
   const [initialData, setInitialData] = useState<any>(null);
   
-  // Sync Safety State
-  const [isLoaded, setIsLoaded] = useState(false); // <--- PREVENTS WIPING DATA
-
+  // 1. CRITICAL: Prevents overwriting DB with empty state on load
+  const initialLoadDone = useRef(false);
+  
   // User State
   const [userName, setUserName] = useState<string>("");
   const [isNameSet, setIsNameSet] = useState(false);
@@ -31,10 +30,11 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   
   // Collab State
   const [activeUsers, setActiveUsers] = useState<any>({});
-  const participantIdRef = useRef<string | null>(null);
   const isReceivingUpdate = useRef(false); 
 
-  // 1. LOAD INITIAL DATA FROM DB
+  // ----------------------------------------------------------------
+  // LOAD DATA
+  // ----------------------------------------------------------------
   useEffect(() => {
     const loadBoard = async () => {
       const { data } = await supabase
@@ -44,18 +44,25 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
         .single();
 
       if (data) {
+        // We load the data into the state
         setInitialData({
           elements: data.elements,
           appState: data.app_state
         });
       }
-      // Mark as loaded so we can start broadcasting changes
-      setIsLoaded(true);
+      
+      // Allow a small buffer before we permit saving changes
+      // This ensures the Excalidraw canvas has time to render the 'initialData'
+      setTimeout(() => {
+          initialLoadDone.current = true;
+      }, 500);
     };
     loadBoard();
   }, [boardId]);
 
-  // 2. SETUP REALTIME SUBSCRIPTION
+  // ----------------------------------------------------------------
+  // REALTIME SUBSCRIPTION
+  // ----------------------------------------------------------------
   useEffect(() => {
     if (!isNameSet || !userName) return;
 
@@ -70,7 +77,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
             excalidrawAPI.updateScene({
                 elements: payload.payload.elements
             });
-            // Short timeout to ensure we don't echo back
+            // Prevent echo
             setTimeout(() => { isReceivingUpdate.current = false; }, 50);
         }
       })
@@ -95,11 +102,16 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   }, [boardId, isNameSet, userName, excalidrawAPI, myColor]);
 
 
-  // 3. BROADCAST CHANGES (Now Protected)
+  // ----------------------------------------------------------------
+  // HANDLE CHANGES (With Safety Checks)
+  // ----------------------------------------------------------------
   const handleChange = (elements: readonly any[], appState: any) => {
-    // SAFETY CHECK: If we haven't loaded DB yet, OR we are receiving an update, DO NOT broadcast.
-    // This stops the "New User Wipes Board" bug.
-    if (!isLoaded || isReceivingUpdate.current) return;
+    // 1. If we are receiving a broadcast, do nothing (don't save, don't echo)
+    if (isReceivingUpdate.current) return;
+
+    // 2. CRITICAL FIX: If we haven't finished loading the initial DB data, 
+    // DO NOT SAVE. This stops the "Empty Board" overwrite bug.
+    if (!initialLoadDone.current) return;
 
     // A. Broadcast to peers (Fast)
     supabase.channel(`room:${boardId}`).send({
@@ -111,12 +123,15 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     // B. Save to DB (Slow/Debounced)
     saveToDb(elements, appState);
 
-    // C. Update my Presence (Viewport)
+    // C. Update Presence
     updateMyPresence(appState);
   };
 
   const saveToDb = useCallback(
     debounce(async (elements, appState) => {
+      // Double check inside the debounce too
+      if (!initialLoadDone.current) return;
+      
       await supabase.from('whiteboards').update({
           elements,
           app_state: appState,
@@ -142,7 +157,9 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     [boardId, userName, myColor]
   );
 
-  // 4. JOIN LOGIC
+  // ----------------------------------------------------------------
+  // ACTIONS
+  // ----------------------------------------------------------------
   const handleJoin = async () => {
     if (!userName) return;
     setIsLoading(true);
@@ -167,14 +184,12 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     setIsLoading(false);
   };
 
-  // 5. SHARE LOGIC
   const handleShare = () => {
     const url = `${window.location.origin}/board/${boardId}`;
     navigator.clipboard.writeText(url);
     alert(`Link copied: ${url}`);
   };
 
-  // 6. JUMP TO USER VIEW
   const followUser = (userData: any) => {
       if (!excalidrawAPI || !userData.view) return;
       excalidrawAPI.updateScene({
@@ -186,7 +201,6 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       });
   };
 
-  // RENDER: LOGIN SCREEN
   if (!isNameSet) {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-gray-100">
@@ -212,12 +226,12 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     );
   }
 
-  // RENDER: WHITEBOARD
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
        
-       {/* AVATAR LIST UI - MOVED TO RIGHT SIDE */}
-       <div className="absolute top-4 right-36 z-10 flex flex-row-reverse gap-2">
+       {/* AVATAR LIST UI - Moved further LEFT to avoid Share Button */}
+       {/* Changed right-36 to right-[220px] (custom tailwind value) */}
+       <div className="absolute top-4 right-[220px] z-10 flex flex-row-reverse gap-2">
           {/* Render myself */}
           <div 
             className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold border-2 border-white shadow-lg"
@@ -269,14 +283,20 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
             </button>
          )}
        >
+         {/* RESTORED ALL MENU ITEMS */}
          <MainMenu>
-            <MainMenu.DefaultItems.ClearCanvas />
+            <MainMenu.DefaultItems.LoadScene />
+            <MainMenu.DefaultItems.SaveToActiveFile />
+            <MainMenu.DefaultItems.Export />
             <MainMenu.DefaultItems.SaveAsImage /> 
-            <MainMenu.DefaultItems.ChangeCanvasBackground />
+            <MainMenu.DefaultItems.Help />
+            <MainMenu.DefaultItems.ClearCanvas />
             <MainMenu.Separator />
             <MainMenu.Item onSelect={handleShare}>
                 Share Link
             </MainMenu.Item>
+            <MainMenu.Separator />
+            <MainMenu.DefaultItems.ChangeCanvasBackground />
          </MainMenu>
        </Excalidraw>
     </div>
