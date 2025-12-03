@@ -4,7 +4,6 @@ import {
   Excalidraw, 
   MainMenu, 
   convertToExcalidrawElements,
-  getSceneVersion
 } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css"; 
 import { supabase } from '@/lib/supabase';
@@ -18,42 +17,34 @@ const getRandomColor = () => {
 export default function Whiteboard({ boardId }: { boardId: string }) {
   const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
   const [initialData, setInitialData] = useState<any>(null);
-  
-  // 1. CRITICAL: Prevents overwriting DB with empty state on load
   const initialLoadDone = useRef(false);
   
-  // User State
+  // User & Collab State
   const [userName, setUserName] = useState<string>("");
   const [isNameSet, setIsNameSet] = useState(false);
   const [myColor] = useState(getRandomColor()); 
   const [isLoading, setIsLoading] = useState(false);
-  
-  // Collab State
   const [activeUsers, setActiveUsers] = useState<any>({});
   const isReceivingUpdate = useRef(false); 
-  const channelRef = useRef<any>(null);
 
-  // ----------------------------------------------------------------
-  // LOAD DATA
-  // ----------------------------------------------------------------
+  // 1. LOAD DATA (Persistence)
   useEffect(() => {
     const loadBoard = async () => {
+      // Fetch latest state from DB
       const { data } = await supabase
         .from('whiteboards')
         .select('elements, app_state')
         .eq('id', boardId)
         .single();
 
-      if (data) {
-        // We load the data into the state
+      if (data && data.elements) {
         setInitialData({
           elements: data.elements,
           appState: data.app_state
         });
       }
       
-      // Allow a small buffer before we permit saving changes
-      // This ensures the Excalidraw canvas has time to render the 'initialData'
+      // Allow Excalidraw to digest the data before we enable saving
       setTimeout(() => {
           initialLoadDone.current = true;
       }, 500);
@@ -61,9 +52,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     loadBoard();
   }, [boardId]);
 
-  // ----------------------------------------------------------------
-  // REALTIME SUBSCRIPTION
-  // ----------------------------------------------------------------
+  // 2. REALTIME
   useEffect(() => {
     if (!isNameSet || !userName) return;
 
@@ -75,12 +64,10 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       .on('broadcast', { event: 'drawing-update' }, (payload) => {
         if (excalidrawAPI) {
             isReceivingUpdate.current = true;
-            // Apply elements and appState (if provided) to fully sync view
+            // Update scene with data from other user
             excalidrawAPI.updateScene({
-                elements: payload.payload.elements,
-                appState: payload.payload.appState || undefined,
+                elements: payload.payload.elements
             });
-            // Prevent echo
             setTimeout(() => { isReceivingUpdate.current = false; }, 50);
         }
       })
@@ -90,8 +77,6 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       })
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
-           // keep a reference to this channel so we reuse it for broadcasts
-           channelRef.current = channel;
            await channel.track({
              user: userName,
              color: myColor,
@@ -103,45 +88,26 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
 
     return () => {
       supabase.removeChannel(channel);
-      channelRef.current = null;
     };
   }, [boardId, isNameSet, userName, excalidrawAPI, myColor]);
 
-
-  // ----------------------------------------------------------------
-  // HANDLE CHANGES (With Safety Checks)
-  // ----------------------------------------------------------------
+  // 3. BROADCAST & SAVE
   const handleChange = (elements: readonly any[], appState: any) => {
-    // 1. If we are receiving a broadcast, do nothing (don't save, don't echo)
-    if (isReceivingUpdate.current) return;
+    if (isReceivingUpdate.current || !initialLoadDone.current) return;
 
-    // 2. CRITICAL FIX: If we haven't finished loading the initial DB data, 
-    // DO NOT SAVE. This stops the "Empty Board" overwrite bug.
-    if (!initialLoadDone.current) return;
-
-    // 3. If elements are empty, don't broadcast/save to avoid overwriting DB
-    if (!elements || elements.length === 0) return;
-
-    // A. Broadcast to peers (Fast)
-    channelRef.current?.send({
+    supabase.channel(`room:${boardId}`).send({
         type: 'broadcast',
         event: 'drawing-update',
-        payload: { elements, appState },
+        payload: { elements },
     });
 
-    // B. Save to DB (Slow/Debounced)
     saveToDb(elements, appState);
-
-    // C. Update Presence
     updateMyPresence(appState);
   };
 
   const saveToDb = useCallback(
     debounce(async (elements, appState) => {
-      // Double check inside the debounce too
       if (!initialLoadDone.current) return;
-      if (!elements || elements.length === 0) return;
-      
       await supabase.from('whiteboards').update({
           elements,
           app_state: appState,
@@ -153,22 +119,21 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
 
   const updateMyPresence = useCallback(
     debounce(async (appState) => {
-      await channelRef.current?.track({
-        user: userName,
-        color: myColor,
-        view: { 
-          scrollX: appState.scrollX, 
-          scrollY: appState.scrollY, 
-          zoom: appState.zoom?.value || 1 
-        }
-      });
+        const channel = supabase.channel(`room:${boardId}`);
+        await channel.track({
+            user: userName,
+            color: myColor,
+            view: { 
+                scrollX: appState.scrollX, 
+                scrollY: appState.scrollY, 
+                zoom: appState.zoom.value 
+            }
+        });
     }, 500), 
     [boardId, userName, myColor]
   );
 
-  // ----------------------------------------------------------------
-  // ACTIONS
-  // ----------------------------------------------------------------
+  // 4. ACTIONS
   const handleJoin = async () => {
     if (!userName) return;
     setIsLoading(true);
@@ -210,6 +175,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       });
   };
 
+  // LOGIN SCREEN
   if (!isNameSet) {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-gray-100">
@@ -238,72 +204,64 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
        
-       {/* AVATAR LIST UI - Moved further LEFT to avoid Share Button */}
-       {/* Changed right-36 to right-[220px] (custom tailwind value) */}
-       <div className="absolute top-4 left-4 z-10 flex gap-2">
-          {/* Render myself */}
-          <div 
-            className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold border-2 border-white shadow-lg"
-            style={{ backgroundColor: myColor }}
-            title={`${userName} (You)`}
-          >
-            {userName.charAt(0).toUpperCase()}
+       {/* CUSTOM HEADER UI: AVATARS + SHARE BUTTON */}
+       {/* Flex container that sits on top of the canvas */}
+       <div className="absolute top-4 right-4 z-20 flex flex-row items-center gap-4 pointer-events-auto">
+          
+          {/* A. User Avatars List */}
+          <div className="flex -space-x-2 overflow-hidden">
+             {/* My Avatar */}
+             <div 
+                className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center text-white font-bold shadow-sm"
+                style={{ backgroundColor: myColor }}
+                title={`${userName} (You)`}
+             >
+                {userName.charAt(0).toUpperCase()}
+             </div>
+
+             {/* Other Users */}
+             {Object.keys(activeUsers).map((key: string) => {
+                 const user = activeUsers[key][0]; 
+                 if (user.user === userName) return null; 
+                 
+                 return (
+                   <div 
+                     key={key}
+                     onClick={() => followUser(user)}
+                     className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center text-white font-bold shadow-sm cursor-pointer hover:z-10 transition-transform hover:scale-110"
+                     style={{ backgroundColor: user.color || '#ccc' }}
+                     title={`Click to jump to ${user.user}`}
+                   >
+                     {user.user.charAt(0).toUpperCase()}
+                   </div>
+                 );
+             })}
           </div>
 
-          {/* Render other users */}
-          {Object.keys(activeUsers).map((key: string) => {
-             const user = activeUsers[key][0]; 
-             if (user.user === userName) return null; 
-
-             return (
-               <div 
-                 key={key}
-                 onClick={() => followUser(user)}
-                 className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold border-2 border-white shadow-lg cursor-pointer hover:scale-110 transition-transform"
-                 style={{ backgroundColor: user.color || '#ccc' }}
-                 title={`Click to jump to ${user.user}'s screen`}
-               >
-                 {user.user.charAt(0).toUpperCase()}
-               </div>
-             );
-          })}
+          {/* B. Share Button */}
+          <button 
+            onClick={handleShare}
+            className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded shadow-lg flex items-center gap-2"
+          >
+            <span>Share</span>
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+              <path d="M13.5 1a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zM11 2.5a2.5 2.5 0 1 1 .603 1.628l-6.718 3.12a2.499 2.499 0 0 1 0 1.504l6.718 3.12a2.5 2.5 0 1 1-.488.876l-6.718-3.12a2.5 2.5 0 1 1 0-3.256l6.718-3.12A2.5 2.5 0 0 1 11 2.5zm-8.5 4a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zm11 5.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/>
+            </svg>
+          </button>
        </div>
 
+       {/* THE BOARD */}
        <Excalidraw
          initialData={initialData}
          excalidrawAPI={(api) => setExcalidrawAPI(api)}
          onChange={(elements, appState) => handleChange(elements, appState)}
-         renderTopRightUI={() => (
-            <button 
-              style={{
-                backgroundColor: "#40c057",
-                color: "white",
-                border: "none",
-                padding: "8px 12px",
-                borderRadius: "4px",
-                cursor: "pointer",
-                height: "36px", 
-                marginLeft: "10px",
-                fontWeight: "bold"
-              }}
-              onClick={handleShare}
-            >
-              Share
-            </button>
-         )}
        >
-         {/* RESTORED ALL MENU ITEMS */}
          <MainMenu>
             <MainMenu.DefaultItems.LoadScene />
             <MainMenu.DefaultItems.SaveToActiveFile />
             <MainMenu.DefaultItems.Export />
             <MainMenu.DefaultItems.SaveAsImage /> 
-            <MainMenu.DefaultItems.Help />
             <MainMenu.DefaultItems.ClearCanvas />
-            <MainMenu.Separator />
-            <MainMenu.Item onSelect={handleShare}>
-                Share Link
-            </MainMenu.Item>
             <MainMenu.Separator />
             <MainMenu.DefaultItems.ChangeCanvasBackground />
          </MainMenu>
