@@ -8,6 +8,7 @@ import {
 import "@excalidraw/excalidraw/index.css"; 
 import { supabase } from '@/lib/supabase';
 import { debounce } from "lodash";
+import { RealtimeChannel } from '@supabase/supabase-js';
 
 const getRandomColor = () => {
   const colors = ['#f44336', '#e91e63', '#9c27b0', '#673ab7', '#3f51b5', '#2196f3', '#009688', '#4caf50', '#ff9800', '#795548'];
@@ -25,12 +26,14 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   const [myColor] = useState(getRandomColor()); 
   const [isLoading, setIsLoading] = useState(false);
   const [activeUsers, setActiveUsers] = useState<any>({});
+  
+  // Refs for Collab Logic
+  const channelRef = useRef<RealtimeChannel | null>(null); // <--- STORES ACTIVE CONNECTION
   const isReceivingUpdate = useRef(false); 
 
-  // 1. LOAD DATA (Persistence)
+  // 1. LOAD DATA
   useEffect(() => {
     const loadBoard = async () => {
-      // Fetch latest state from DB
       const { data } = await supabase
         .from('whiteboards')
         .select('elements, app_state')
@@ -43,40 +46,47 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
           appState: data.app_state
         });
       }
-      
-      // Allow Excalidraw to digest the data before we enable saving
-      setTimeout(() => {
-          initialLoadDone.current = true;
-      }, 500);
+      setTimeout(() => { initialLoadDone.current = true; }, 500);
     };
     loadBoard();
   }, [boardId]);
 
-  // 2. REALTIME
+  // 2. REALTIME CONNECTION (The Fix)
   useEffect(() => {
     if (!isNameSet || !userName) return;
 
+    // A. Create Channel
     const channel = supabase.channel(`room:${boardId}`, {
       config: { presence: { key: userName } },
     });
 
+    // Save ref so we can use it in handleChange
+    channelRef.current = channel;
+
     channel
+      // B. Listen for Drawings
       .on('broadcast', { event: 'drawing-update' }, (payload) => {
         if (excalidrawAPI) {
+            // Flag to prevent echo
             isReceivingUpdate.current = true;
-            // Update scene with data from other user
+            
+            // Apply changes
             excalidrawAPI.updateScene({
                 elements: payload.payload.elements
             });
+            
+            // Reset flag
             setTimeout(() => { isReceivingUpdate.current = false; }, 50);
         }
       })
+      // C. Listen for Presence (Avatars)
       .on('presence', { event: 'sync' }, () => {
         const state = channel.presenceState();
         setActiveUsers(state);
       })
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
+           console.log("Connected to Realtime!"); 
            await channel.track({
              user: userName,
              color: myColor,
@@ -88,20 +98,29 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
 
     return () => {
       supabase.removeChannel(channel);
+      channelRef.current = null;
     };
   }, [boardId, isNameSet, userName, excalidrawAPI, myColor]);
 
+
   // 3. BROADCAST & SAVE
   const handleChange = (elements: readonly any[], appState: any) => {
+    // Stop if we are receiving data OR if initial load isn't done
     if (isReceivingUpdate.current || !initialLoadDone.current) return;
 
-    supabase.channel(`room:${boardId}`).send({
-        type: 'broadcast',
-        event: 'drawing-update',
-        payload: { elements },
-    });
+    // A. Broadcast using the ACTIVE channel ref (Fixes connection issue)
+    if (channelRef.current) {
+        channelRef.current.send({
+            type: 'broadcast',
+            event: 'drawing-update',
+            payload: { elements },
+        });
+    }
 
+    // B. Save to DB
     saveToDb(elements, appState);
+
+    // C. Update Presence
     updateMyPresence(appState);
   };
 
@@ -119,18 +138,19 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
 
   const updateMyPresence = useCallback(
     debounce(async (appState) => {
-        const channel = supabase.channel(`room:${boardId}`);
-        await channel.track({
-            user: userName,
-            color: myColor,
-            view: { 
-                scrollX: appState.scrollX, 
-                scrollY: appState.scrollY, 
-                zoom: appState.zoom.value 
-            }
-        });
+        if (channelRef.current) {
+            await channelRef.current.track({
+                user: userName,
+                color: myColor,
+                view: { 
+                    scrollX: appState.scrollX, 
+                    scrollY: appState.scrollY, 
+                    zoom: appState.zoom.value 
+                }
+            });
+        }
     }, 500), 
-    [boardId, userName, myColor]
+    [userName, myColor]
   );
 
   // 4. ACTIONS
@@ -175,7 +195,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       });
   };
 
-  // LOGIN SCREEN
+  // LOGIN UI
   if (!isNameSet) {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-gray-100">
@@ -204,15 +224,14 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
        
-       {/* CUSTOM HEADER UI: AVATARS + SHARE BUTTON */}
-       {/* Flex container that sits on top of the canvas */}
+       {/* UI: AVATARS + SHARE */}
        <div className="absolute top-4 right-4 z-20 flex flex-row items-center gap-4 pointer-events-auto">
           
-          {/* A. User Avatars List */}
+          {/* AVATARS LIST */}
           <div className="flex -space-x-2 overflow-hidden">
-             {/* My Avatar */}
+             {/* My Avatar (CSS Fix: leading-none) */}
              <div 
-                className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center text-white font-bold shadow-sm"
+                className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center leading-none text-white font-bold shadow-sm"
                 style={{ backgroundColor: myColor }}
                 title={`${userName} (You)`}
              >
@@ -228,7 +247,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
                    <div 
                      key={key}
                      onClick={() => followUser(user)}
-                     className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center text-white font-bold shadow-sm cursor-pointer hover:z-10 transition-transform hover:scale-110"
+                     className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center leading-none text-white font-bold shadow-sm cursor-pointer hover:z-10 transition-transform hover:scale-110"
                      style={{ backgroundColor: user.color || '#ccc' }}
                      title={`Click to jump to ${user.user}`}
                    >
@@ -238,7 +257,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
              })}
           </div>
 
-          {/* B. Share Button */}
+          {/* SHARE BUTTON */}
           <button 
             onClick={handleShare}
             className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded shadow-lg flex items-center gap-2"
@@ -250,7 +269,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
           </button>
        </div>
 
-       {/* THE BOARD */}
+       {/* BOARD */}
        <Excalidraw
          initialData={initialData}
          excalidrawAPI={(api) => setExcalidrawAPI(api)}
