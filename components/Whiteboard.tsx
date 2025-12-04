@@ -26,19 +26,39 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   const [myColor] = useState(getRandomColor()); 
   const [isLoading, setIsLoading] = useState(false);
   const [activeUsers, setActiveUsers] = useState<any>({});
+  const [showCopied, setShowCopied] = useState(false);
   
   // Refs for Collab Logic
   const channelRef = useRef<RealtimeChannel | null>(null); // <--- STORES ACTIVE CONNECTION
   const isReceivingUpdate = useRef(false); 
 
-  // 1. LOAD DATA
+  // 1. LOAD DATA (Auto-create board if doesn't exist)
   useEffect(() => {
     const loadBoard = async () => {
-      const { data } = await supabase
+      // Try to get existing board
+      let { data, error } = await supabase
         .from('whiteboards')
         .select('elements, app_state')
         .eq('id', boardId)
         .single();
+
+      // If board doesn't exist, create it
+      if (error && error.code === 'PGRST116') {
+        const { data: newBoard } = await supabase
+          .from('whiteboards')
+          .insert({
+            id: boardId,
+            elements: [],
+            app_state: {},
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            last_activity: new Date().toISOString()
+          })
+          .select()
+          .single();
+        
+        data = newBoard;
+      }
 
       if (data && data.elements) {
         setInitialData({
@@ -87,6 +107,12 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
            console.log("Connected to Realtime!"); 
+           
+           // Update board activity timestamp when user joins
+           await supabase.from('whiteboards').update({
+             last_activity: new Date().toISOString()
+           }).eq('id', boardId);
+           
            await channel.track({
              user: userName,
              color: myColor,
@@ -99,6 +125,11 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     return () => {
       supabase.removeChannel(channel);
       channelRef.current = null;
+      
+      // Update last activity when user disconnects
+      supabase.from('whiteboards').update({
+        last_activity: new Date().toISOString()
+      }).eq('id', boardId);
     };
   }, [boardId, isNameSet, userName, excalidrawAPI, myColor]);
 
@@ -131,6 +162,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
           elements,
           app_state: appState,
           updated_at: new Date().toISOString(),
+          last_activity: new Date().toISOString()
         }).eq('id', boardId);
     }, 2000),
     [boardId]
@@ -181,7 +213,8 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   const handleShare = () => {
     const url = `${window.location.origin}/board/${boardId}`;
     navigator.clipboard.writeText(url);
-    alert(`Link copied: ${url}`);
+    setShowCopied(true);
+    setTimeout(() => setShowCopied(false), 2000);
   };
 
   const followUser = (userData: any) => {
@@ -260,11 +293,15 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
           {/* SHARE BUTTON */}
           <button 
             onClick={handleShare}
-            className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded shadow-lg flex items-center gap-2"
+            className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded shadow-lg flex items-center gap-2 relative"
           >
-            <span>Share</span>
+            <span>{showCopied ? 'Link Copied!' : 'Share'}</span>
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
-              <path d="M13.5 1a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zM11 2.5a2.5 2.5 0 1 1 .603 1.628l-6.718 3.12a2.499 2.499 0 0 1 0 1.504l6.718 3.12a2.5 2.5 0 1 1-.488.876l-6.718-3.12a2.5 2.5 0 1 1 0-3.256l6.718-3.12A2.5 2.5 0 0 1 11 2.5zm-8.5 4a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zm11 5.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/>
+              {showCopied ? (
+                <path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/>
+              ) : (
+                <path d="M13.5 1a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zM11 2.5a2.5 2.5 0 1 1 .603 1.628l-6.718 3.12a2.499 2.499 0 0 1 0 1.504l6.718 3.12a2.5 2.5 0 1 1-.488.876l-6.718-3.12a2.5 2.5 0 1 1 0-3.256l6.718-3.12A2.5 2.5 0 0 1 11 2.5zm-8.5 4a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zm11 5.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/>
+              )}
             </svg>
           </button>
        </div>
