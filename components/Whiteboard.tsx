@@ -136,19 +136,27 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       })
       .subscribe(async (status) => {
         if (status === 'SUBSCRIBED') {
-           console.log("Connected to Realtime!"); 
+           console.log("Connected to Realtime!", userName); 
            
            // Update board activity timestamp when user joins
            await supabase.from('whiteboards').update({
              last_activity: new Date().toISOString()
            }).eq('id', boardId);
            
+           // Track presence
            await channel.track({
              user: userName,
              color: myColor,
              view: { x: 0, y: 0, zoom: 1 }, 
              online_at: new Date().toISOString(),
            });
+           
+           // Force presence state update after tracking
+           setTimeout(() => {
+             const state = channel.presenceState();
+             console.log('Current presence state:', state);
+             setActiveUsers(state);
+           }, 100);
         }
       });
 
@@ -169,7 +177,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     // Stop if we are receiving data OR if initial load isn't done
     if (isReceivingUpdate.current || !initialLoadDone.current) return;
 
-    // A. Broadcast using the ACTIVE channel ref (Fixes connection issue)
+    // A. IMMEDIATE Broadcast (NO debounce for real-time)
     if (channelRef.current && excalidrawAPI) {
         const sceneData = excalidrawAPI.getSceneElements();
         const files = excalidrawAPI.getFiles();
@@ -184,10 +192,10 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
         });
     }
 
-    // B. Save to DB
+    // B. Debounced Save to DB (only DB operations are debounced)
     saveToDb(elements, appState);
 
-    // C. Update Presence
+    // C. Update Presence (debounced)
     updateMyPresence(appState);
   };
 
@@ -207,7 +215,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
           updated_at: new Date().toISOString(),
           last_activity: new Date().toISOString()
         }).eq('id', boardId);
-    }, 500),
+    }, 1000),
     [boardId]
   );
 
