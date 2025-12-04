@@ -229,13 +229,13 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
           
           {/* AVATARS LIST */}
           <div className="flex -space-x-2 overflow-hidden">
-             {/* My Avatar (CSS Fix: leading-none) */}
+             {/* My Avatar */}
              <div 
-                className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center leading-none text-white font-bold shadow-sm"
-                style={{ backgroundColor: myColor }}
+                className="h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center text-white font-bold shadow-sm"
+                style={{ backgroundColor: myColor, lineHeight: '1' }}
                 title={`${userName} (You)`}
              >
-                {userName.charAt(0).toUpperCase()}
+                <span className="text-sm">{userName.charAt(0).toUpperCase()}</span>
              </div>
 
              {/* Other Users */}
@@ -247,11 +247,11 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
                    <div 
                      key={key}
                      onClick={() => followUser(user)}
-                     className="inline-block h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center leading-none text-white font-bold shadow-sm cursor-pointer hover:z-10 transition-transform hover:scale-110"
-                     style={{ backgroundColor: user.color || '#ccc' }}
+                     className="h-10 w-10 rounded-full ring-2 ring-white flex items-center justify-center text-white font-bold shadow-sm cursor-pointer hover:z-10 transition-transform hover:scale-110"
+                     style={{ backgroundColor: user.color || '#ccc', lineHeight: '1' }}
                      title={`Click to jump to ${user.user}`}
                    >
-                     {user.user.charAt(0).toUpperCase()}
+                     <span className="text-sm">{user.user.charAt(0).toUpperCase()}</span>
                    </div>
                  );
              })}
