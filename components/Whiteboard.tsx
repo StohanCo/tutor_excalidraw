@@ -100,13 +100,20 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
             // Flag to prevent echo
             isReceivingUpdate.current = true;
             
-            // Apply changes
-            excalidrawAPI.updateScene({
+            // Apply changes with files support
+            const updateData: any = {
                 elements: payload.payload.elements,
                 appState: {
                   collaborators: new Map()
                 }
-            });
+            };
+            
+            // Add files if present (for images)
+            if (payload.payload.files) {
+              excalidrawAPI.addFiles(Object.values(payload.payload.files));
+            }
+            
+            excalidrawAPI.updateScene(updateData);
             
             // Reset flag
             setTimeout(() => { isReceivingUpdate.current = false; }, 50);
@@ -114,6 +121,16 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       })
       // C. Listen for Presence (Avatars)
       .on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState();
+        setActiveUsers(state);
+      })
+      .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+        console.log('User joined:', newPresences);
+        const state = channel.presenceState();
+        setActiveUsers(state);
+      })
+      .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+        console.log('User left:', leftPresences);
         const state = channel.presenceState();
         setActiveUsers(state);
       })
@@ -153,11 +170,17 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
     if (isReceivingUpdate.current || !initialLoadDone.current) return;
 
     // A. Broadcast using the ACTIVE channel ref (Fixes connection issue)
-    if (channelRef.current) {
+    if (channelRef.current && excalidrawAPI) {
+        const sceneData = excalidrawAPI.getSceneElements();
+        const files = excalidrawAPI.getFiles();
+        
         channelRef.current.send({
             type: 'broadcast',
             event: 'drawing-update',
-            payload: { elements },
+            payload: { 
+              elements: sceneData,
+              files: files 
+            },
         });
     }
 
@@ -184,7 +207,7 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
           updated_at: new Date().toISOString(),
           last_activity: new Date().toISOString()
         }).eq('id', boardId);
-    }, 2000),
+    }, 500),
     [boardId]
   );
 
