@@ -63,7 +63,17 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
       if (data && data.elements) {
         setInitialData({
           elements: data.elements,
-          appState: data.app_state
+          appState: {
+            ...(data.app_state || {}),
+            collaborators: new Map()
+          }
+        });
+      } else {
+        setInitialData({
+          elements: [],
+          appState: {
+            collaborators: new Map()
+          }
         });
       }
       setTimeout(() => { initialLoadDone.current = true; }, 500);
@@ -92,7 +102,10 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
             
             // Apply changes
             excalidrawAPI.updateScene({
-                elements: payload.payload.elements
+                elements: payload.payload.elements,
+                appState: {
+                  collaborators: new Map()
+                }
             });
             
             // Reset flag
@@ -158,9 +171,16 @@ export default function Whiteboard({ boardId }: { boardId: string }) {
   const saveToDb = useCallback(
     debounce(async (elements, appState) => {
       if (!initialLoadDone.current) return;
+      
+      // Clean appState to remove non-serializable data like collaborators Map
+      const cleanAppState = {
+        ...appState,
+        collaborators: undefined // Remove Map object
+      };
+      
       await supabase.from('whiteboards').update({
           elements,
-          app_state: appState,
+          app_state: cleanAppState,
           updated_at: new Date().toISOString(),
           last_activity: new Date().toISOString()
         }).eq('id', boardId);
